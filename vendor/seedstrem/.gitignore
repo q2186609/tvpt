@@ -1,0 +1,30 @@
+# Binaries
+/seedstrem
+/bin/
+/dist/
+
+# Test artifacts
+coverage.out
+*.test
+
+# Web
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+
+# Local state
+*.db
+config.yaml
+!config.example.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Superpowers brainstorm scratch
+.superpowers/

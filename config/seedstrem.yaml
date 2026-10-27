@@ -1,0 +1,143 @@
+# seedstrem 配置: PT 场景调优
+#
+# 关键取舍说明:
+#   seeding.full = true  播完后把整包下完再完整做种。原因（合规风险）:
+#                        只下单集时 announce 里 left > 0, tracker 上始终是 leecher,
+#                        做种时长可能不累计, 有 H&R 风险。代价是占磁盘。
+#                        如果你核实站点明确允许部分做种, 改成 false 可以省大量空间。
+#   cleanup.seed_time    按站点最小做种时长设。默认 72h 是保守值,
+#                        NexusPHP 系站点常见要求是 7~10 天窗口内做种 24~48h。
+#                        每站规则不同, 用 indexer_seed_times 单独覆盖。
+#   stream.wait_timeout  边下边播时等待缺失分片的上限, 超时返回 503 让播放器重试。
+
+server:
+  listen: ":8080"
+  # 必须填本机局域网 IP, Stremio 客户端靠这个地址回连
+  external_url: "https://tvpt.example.com"
+  admin_password: ""
+
+downloader:
+  type: "qbittorrent"
+  adopt_labelled: false
+
+qbittorrent:
+  url: "http://qbittorrent:8080"
+  username: "admin"
+  password: ""
+  category: "tvpt"
+
+prowlarr:
+  url: "http://prowlarr:9696"
+  api_key: ""
+  movie_categories: [2000]
+  tv_categories: [5000]
+  anime_categories: [5070]
+  indexer_ids: []
+  # Prowlarr 没有请求级超时, 单个慢站会拖垮整次搜索。
+  # PT 站响应普遍偏慢, 15s 是实测起点, 站多时可上调。
+  search_timeout: 15s
+  # 重复搜索同一部片时命中缓存, 直接减少 PT 站的 API 调用次数。
+  # 这是防止触发站点频率限制的第一道防线, 不要设成 0。
+  search_cache_ttl: 10m
+
+addon:
+  enable_movies: true
+  enable_series: true
+  enable_anime: false
+
+filters:
+  # PT 站的种子健康度比公开站好, 1 个做种就能用
+  min_seeders: 1
+  min_size_mb: 0
+  max_size_mb: 0
+  max_results: 20
+
+meta:
+  cinemeta_url: "https://v3-cinemeta.strem.io"
+  # 等待 qBittorrent 拿到种子元数据的上限。PT 站的 .torrent 需要 tracker
+  # 认证才能取到, 有时会慢, 放宽到 90s
+  metadata_timeout: 90s
+  # 有 TMDb key 时, 支持 TmdbId 搜索的索引器可以走精确匹配,
+  # 对中文站片名匹配的召回率有明显帮助
+  tmdb_api_key: ""
+
+paths:
+  mappings:
+    # qBittorrent 容器内路径 -> seedstrem 容器内路径
+    - remote: "/downloads"
+      local: "/data"
+
+storage:
+  # 放在 named volume 上（不是 bind mount），见 docker-compose.yml 注释
+  database: "/config/db/seedstrem.db"
+  delete_files_on_remove: true
+  # 下载盘使用率上限。留 10% 余量给系统和其他写入。
+  max_disk_usage_percent: 90
+  # 绝对容量上限, 单位 GB。按你的 NAS 盘容量填, 0 = 不限。
+  # 4K remux 一集可能 30~60GB, 整包做种很容易上百 GB, 建议设置。
+  max_download_storage_gb: 0
+
+stream:
+  # PT 站冷门种子拿到首个数据分片可能很慢, 60s 偏紧, 放宽到 90s
+  wait_timeout: 90s
+  read_chunk: 4194304
+
+playback:
+  # 播放驱动的下载策略: 正在看的种子优先下, 没人看就暂停,
+  # 长时间没人看就删种+删文件。
+  # 停播多久后暂停下载。0 表示关闭暂停(一路下到底)。
+  # 已下载完成的种子不会被暂停, 继续做种攒分享率。
+  idle_pause: 5m
+  # 首次播放给予的留存期, 到期即删除种子和文件。
+  retention: 72h
+  # 每再播放一次, 到期时间至少顺延到"现在 + 该值"(不会缩短)。
+  extend_per_play: 24h
+
+cleanup:
+  # 默认做种时长, 单位支持 h/m/s。72h 是保守基线,
+  # 但启用上面的 playback 策略后, 生命周期统一由"播放留存"决定,
+  # 这里必须设 0, 否则做种满 72h 的种子会被提前删掉, 违反"有播放就续"。
+  seed_time: 0h
+  # 关闭播放后(没看完就退出)的种子保留门槛。低于此进度会被当作
+  # "放弃的下载" 直接删除。
+  # 注意: 这个值不能设太高。实测 0.15 时, 4K 片源刚下到 12% 用户
+  # 退出就被删种, 再次点播要从零重下, 表现为"播放不了"。
+  # 设为 0 表示任何进度都保留, 由 seed_time 统一管理生命周期。
+  min_progress_for_cancel: 0
+  # 达到这个分享率即可被清理, 与 seed_time 是 OR 关系。0 = 不按分享率清理
+  target_ratio: 0
+  delete_policy: oldest_first
+  # 按站点覆盖做种时长。键名必须和 Prowlarr 里的 indexer 名称一致(不区分大小写)。
+  # 部署后请按各站规则页的实际要求填写, 下面是示意值。
+  indexer_seed_times:
+    # 同理, 启用 playback 策略后按站点覆盖也应设 0, 否则会绕过播放留存规则。
+    # 若某站有强制 H&R 做种要求, 再单独填该站的值。
+    M-Team: 0h
+    HDSky: 0h
+    HDHome: 0h
+
+seeding:
+  # true: 播完后整包下完, 成为完整 seeder, 做种时长稳定累计
+  # false: 只下播放的那一集, 其他文件 priority=0 跳过, 省磁盘但可能不算做种
+  full: true
+
+rss:
+  # 后台自动抓新种攒分享率。它会主动下载你没点播的内容,
+  # 验证阶段保持关闭, 避免影响对点播链路的观测。
+  enabled: false
+  interval: 15m
+  max_grabs_per_cycle: 5
+  max_concurrent_downloads: 2
+  max_active_torrents: 20
+  freeleech_only: false
+  filters:
+    min_size_mb: 0
+    max_size_mb: 0
+    categories: []
+    include_keywords: []
+    exclude_keywords: []
+
+log:
+  # debug 会输出每个 HTTP 请求 (method/path/status), 便于确认 Stremio
+  # 客户端到底请求了什么. 排查完可改回 info.
+  level: "debug"

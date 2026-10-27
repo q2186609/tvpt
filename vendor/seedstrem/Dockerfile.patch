@@ -1,0 +1,36 @@
+# 只编译 seedstrem 二进制, 然后替换到官方镜像里。
+#
+# 不复制官方 Dockerfile 的 runtime 阶段: 它依赖 lscr.io/linuxserver/baseimage-ubuntu,
+# 而该镜像在当前网络下拉不到。官方镜像的 /seedstrem 是 CGO_ENABLED=0 的静态
+# 二进制, 所以把新编译的二进制覆盖上去即可, s6-overlay 等其他部分保持原样。
+#
+# web/embed.go 里有 //go:embed all:dist, dist 目录不存在会直接编译失败,
+# 因此必须先构建前端。
+#
+# 用法: docker build -f vendor/seedstrem/Dockerfile.patch -t tvpt/seedstrem:patched .
+
+# --- 前端 ---
+FROM node:22-alpine AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# --- Go 二进制 ---
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+# 构建环境里 proxy.golang.org 的 DNS 会解析到不可达的 IPv6 地址,
+# 换用国内可用镜像源。
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.google.cn
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=web /src/web/dist ./web/dist
+ARG VERSION=poc
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /seedstrem ./cmd/seedstrem
+
+# --- 复用官方镜像的 runtime ---
+FROM ghcr.nju.edu.cn/kipsilabs/seedstrem:latest
+COPY --from=build /seedstrem /seedstrem

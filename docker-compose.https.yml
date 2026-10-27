@@ -1,0 +1,25 @@
+# HTTPS 入口覆盖层: 给 Stremio(Android TV) 用
+# 用法(必须和主 compose 一起用):
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up -d
+#
+# 背景: Stremio TV 版会把 addon 地址里的 http:// 强制改写成 https://,
+# 所以局域网明文 addon 装不进去, 必须有一个公共 CA 签发证书的 https 入口。
+#
+# 证书由 scripts/https-cert.sh 在另一台 Linux 机器上签发并提交进仓库
+# (certs/tvpt.example.com/), 这里只做只读挂载; 换证书后 restart 本服务。
+
+services:
+  proxy:
+    image: nginx:alpine
+    container_name: tvpt-proxy
+    volumes:
+      - ./config/nginx-tvpt.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./data/static:/usr/share/nginx/clash:ro
+    ports:
+      - "443:443"
+      # 明文 HTTP 口只给调试/局域网兜底用（模拟器 adb reverse 到 127.0.0.1:8082）
+      - "8082:80"
+    depends_on:
+      - seedstrem
+    restart: unless-stopped

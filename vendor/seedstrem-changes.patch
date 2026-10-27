@@ -1,0 +1,302 @@
+diff --git a/internal/prowlarr/client.go b/internal/prowlarr/client.go
+index 2ab910f..cfb8b85 100644
+--- a/internal/prowlarr/client.go
++++ b/internal/prowlarr/client.go
+@@ -33,6 +33,15 @@ type Result struct {
+ 	// metadata fetch, which is unreliable for private-tracker peers. Nil
+ 	// when the release already had a magnet/infohash.
+ 	TorrentFile []byte
++	// DownloadURL is set for magnet-less releases whose infohash was NOT
++	// resolved during the search (deferred mode). The stream list is built
++	// from these without any extra round trip; ResolveDownloadURL turns one
++	// into a magnet on demand when the user actually plays it.
++	//
++	// This exists because Prowlarr serializes .torrent downloads per
++	// indexer: resolving every result cost 12-18s for a 9-result page,
++	// long enough that Stremio gave up and reported the addon as missing.
++	DownloadURL string
+ 	Size        int64
+ 	Seeders     int
+ 	Categories  []int
+@@ -152,36 +161,51 @@ func (c *Client) Search(ctx context.Context, query, searchType string, categorie
+ 	}
+ 
+ 	out := make([]Result, 0, len(raw))
++
+ 	for _, r := range raw {
+ 		if r.Protocol != "" && r.Protocol != "torrent" {
+ 			continue // usenet or unknown — not resolvable via qBittorrent
+ 		}
+ 		res := normalize(r)
+ 		if res.MagnetURL == "" && r.DownloadURL != "" {
+-			// Some (typically private-tracker) indexers omit magnetUrl and
+-			// infoHash and only publish a .torrent download link. Fetch it
+-			// and derive the hash ourselves rather than dropping the
+-			// release outright.
+-			if hash, name, trackers, raw, err := c.fetchTorrentHash(ctx, r.DownloadURL); err == nil {
+-				res.InfoHash = hash
+-				if res.Title == "" {
+-					res.Title = name
+-				}
+-				res.MagnetURL = synthesizeMagnet(hash, res.Title, trackers)
+-				// Keep the raw .torrent so the play flow can add it
+-				// directly (skipping qBittorrent's unreliable metadata
+-				// fetch); the magnet above is the fallback.
+-				res.TorrentFile = raw
+-			}
++			// Magnet-less release (private trackers omit magnetUrl and
++			// infoHash and publish only a .torrent link). Keep the link and
++			// defer the round trip to ResolveDownloadURL so building the
++			// stream list costs nothing extra.
++			//
++			// Resolving here instead made the list take 12-18s for a
++			// 9-result page — Prowlarr serializes .torrent downloads per
++			// indexer, so concurrency did not help — and Stremio answered
++			// "no addon" rather than show the list.
++			res.DownloadURL = r.DownloadURL
+ 		}
+-		if res.MagnetURL == "" {
+-			continue // no magnet and no infohash — cannot resolve-on-play
++		if res.MagnetURL == "" && res.DownloadURL == "" {
++			continue // cannot resolve-on-play either way
+ 		}
+ 		out = append(out, res)
+ 	}
+ 	return out, nil
+ }
+ 
++// ResolveDownloadURL completes a deferred magnet-less result: it fetches
++// the .torrent, derives the infohash and announce trackers, and returns a
++// playable magnet plus the raw torrent bytes. It reports an error when the
++// release carries no download URL (already resolved, or unresolvable).
++func (c *Client) ResolveDownloadURL(ctx context.Context, res Result) (magnet string, raw []byte, err error) {
++	if res.DownloadURL == "" {
++		return "", nil, fmt.Errorf("prowlarr: release has no download URL")
++	}
++	hash, name, trackers, rawBytes, err := c.fetchTorrentHash(ctx, res.DownloadURL)
++	if err != nil {
++		return "", nil, err
++	}
++	title := res.Title
++	if title == "" {
++		title = name
++	}
++	return synthesizeMagnet(hash, title, trackers), rawBytes, nil
++}
++
+ // SearchEach runs query as one search per indexer concurrently and returns
+ // the union of results from indexers that answered within budget.
+ //
+diff --git a/internal/stremio/play.go b/internal/stremio/play.go
+index 26262d0..06b5a1a 100644
+--- a/internal/stremio/play.go
++++ b/internal/stremio/play.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/go-chi/chi/v5"
+ 
+ 	"github.com/kipsilabs/seedstrem/internal/metainfo"
++	"github.com/kipsilabs/seedstrem/internal/prowlarr"
+ 	"github.com/kipsilabs/seedstrem/internal/torrents"
+ )
+ 
+@@ -21,12 +22,44 @@ func (h *Handler) play(w http.ResponseWriter, r *http.Request) {
+ 	infohash := strings.ToLower(chi.URLParam(r, "infohash"))
+ 	magnet := r.URL.Query().Get("magnet")
+ 
++	// Deferred magnet-less release: the stream list did not resolve its
++	// infohash, because each such result costs a .torrent round trip and
++	// Prowlarr serializes them per indexer (a 9-result page took 12-18s,
++	// which made Stremio report the addon as missing). Resolve it now, on
++	// the actual play — a single round trip behind a spinner the user
++	// already expects.
++	var torrentFile []byte
++	if dl := r.URL.Query().Get("dl"); dl != "" {
++		resolvedMagnet, raw, err := h.prowlarr(s).ResolveDownloadURL(ctx, prowlarr.Result{
++			Title:       r.URL.Query().Get("t"),
++			DownloadURL: dl,
++		})
++		if err != nil {
++			h.logger.Error("stremio: deferred resolve failed", "error", err)
++			http.Error(w, "failed to resolve stream", http.StatusBadGateway)
++			return
++		}
++		hash, _, err := metainfo.FromMagnet(resolvedMagnet)
++		if err != nil {
++			http.Error(w, "failed to resolve stream", http.StatusBadGateway)
++			return
++		}
++		magnet = resolvedMagnet
++		infohash = hash
++		torrentFile = raw
++	}
++
+ 	if magnet == "" {
+ 		http.Error(w, "missing magnet", http.StatusBadRequest)
+ 		return
+ 	}
+-	// Guard: the magnet must match the path infohash.
+-	if hash, _, err := metainfo.FromMagnet(magnet); err != nil || hash != infohash {
++	// Guard: the magnet must match the path infohash. A deferred play has
++	// no infohash in the path (it is only known after resolution), so the
++	// comparison applies only when one was supplied.
++	if hash, _, err := metainfo.FromMagnet(magnet); err != nil {
++		http.Error(w, "invalid magnet", http.StatusBadRequest)
++		return
++	} else if !strings.HasPrefix(strings.ToLower(chi.URLParam(r, "infohash")), "dl-") && hash != infohash {
+ 		http.Error(w, "magnet does not match infohash", http.StatusBadRequest)
+ 		return
+ 	}
+@@ -53,8 +86,11 @@ func (h *Handler) play(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// If we cached the raw .torrent for this infohash while building the
+ 	// stream list, add it directly (skips qBittorrent's metadata fetch);
+-	// otherwise fall back to the magnet.
+-	torrentFile := h.torrentFiles.get(infohash)
++	// otherwise fall back to the magnet. A deferred play already has the
++	// bytes from its own resolve above.
++	if len(torrentFile) == 0 {
++		torrentFile = h.torrentFiles.get(infohash)
++	}
+ 	link, err := h.svc.Resolve(ctx, magnet, torrentFile, sel)
+ 	if err != nil {
+ 		switch {
+diff --git a/internal/stremio/stream.go b/internal/stremio/stream.go
+index 613d815..5e37528 100644
+--- a/internal/stremio/stream.go
++++ b/internal/stremio/stream.go
+@@ -2,6 +2,8 @@ package stremio
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+@@ -18,6 +20,15 @@ import (
+ 	"github.com/kipsilabs/seedstrem/internal/store"
+ )
+ 
++// downloadToken derives a short, stable, URL-safe identifier from a
++// Prowlarr download link. It stands in for the infohash in a play URL when
++// the infohash is not resolved until play time; it also keys the pending
++// release cache so the play handler can recover the release's title.
++func downloadToken(downloadURL string) string {
++	sum := sha256.Sum256([]byte(downloadURL))
++	return hex.EncodeToString(sum[:12])
++}
++
+ // streamItem is one entry in a Stremio stream response.
+ type streamItem struct {
+ 	Name          string         `json:"name"`
+@@ -63,21 +74,18 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	// Torrents the app already added for exactly this content are offered
+-	// first as high-priority streams (instant/near-instant playback). Look
+-	// them up before searching — it's a cheap local query, and when we
+-	// already have the content we skip the slow Prowlarr search entirely
+-	// (that network call was tripping the caller's fetch timeout, which
+-	// canceled the request before any streams were returned).
++	// Owned torrents (already added for this exact content) are looked up
++	// first so they can be offered as high-priority streams. The Prowlarr
++	// search still runs: owned torrents may be stalled, still downloading,
++	// or simply the wrong release, and returning only them leaves the user
++	// with a single unusable entry. The search is cheap now that magnet-less
++	// results resolve on play rather than here.
+ 	owned := h.svc.OwnedForContent(ctx, q.Source, q.ID, q.Season, q.Episode)
+ 
+-	var results []prowlarr.Result
+-	if len(owned) > 0 {
+-		h.logger.Debug("stremio: serving owned content, skipping prowlarr search", "id", id, "owned", len(owned))
+-	} else {
+-		results, err = h.discoverySearch(ctx, q, s)
+-		if err != nil {
+-			h.logger.Warn("stremio: discovery search failed", "id", id, "error", err)
++	results, err := h.discoverySearch(ctx, q, s)
++	if err != nil {
++		h.logger.Warn("stremio: discovery search failed", "id", id, "error", err)
++		if len(owned) == 0 {
+ 			writeJSON(w, http.StatusOK, empty)
+ 			return
+ 		}
+@@ -107,10 +115,13 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// Best-effort: annotate results (and owned torrents) with their live
+ 	// download progress. One batched call; failures/misses just mean no
+-	// annotation.
++	// annotation. Deferred (magnet-less) results have no infohash yet and
++	// are simply left unannotated.
+ 	hashes := make([]string, 0, len(results)+len(owned))
+ 	for _, res := range results {
+-		hashes = append(hashes, res.InfoHash)
++		if res.InfoHash != "" {
++			hashes = append(hashes, res.InfoHash)
++		}
+ 	}
+ 	for _, t := range owned {
+ 		hashes = append(hashes, t.Hash)
+@@ -124,7 +135,9 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+ 	// handled above.
+ 	resultHashes := make([]string, 0, len(results))
+ 	for _, res := range results {
+-		resultHashes = append(resultHashes, res.InfoHash)
++		if res.InfoHash != "" {
++			resultHashes = append(resultHashes, res.InfoHash)
++		}
+ 	}
+ 	cached := h.svc.StoredByHashes(ctx, resultHashes)
+ 
+@@ -172,7 +185,11 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+ 		if len(res.TorrentFile) > 0 {
+ 			h.torrentFiles.put(res.InfoHash, res.TorrentFile)
+ 		}
+-		items = append(items, h.toStreamItem(s.ExternalURL, q, res, progress[res.InfoHash]))
++		item := h.toStreamItem(s.ExternalURL, q, res, progress[res.InfoHash])
++		if item.URL == "" {
++			continue // unresolvable release (no magnet, hash or download link)
++		}
++		items = append(items, item)
+ 	}
+ 	writeJSON(w, http.StatusOK, streamResponse{Streams: items})
+ }
+@@ -585,7 +602,9 @@ func buildTextSearch(q meta.Query, title string, year int, p ProwlarrSettings) (
+ func (h *Handler) toStreamItem(externalURL string, q meta.Query, res prowlarr.Result, progress float64) streamItem {
+ 	base := strings.TrimSuffix(externalURL, "/")
+ 	v := url.Values{}
+-	v.Set("magnet", res.MagnetURL)
++	if res.MagnetURL != "" {
++		v.Set("magnet", res.MagnetURL)
++	}
+ 	// Persist the content identity through play so later stream requests
+ 	// can surface this torrent as already-owned (see stream handler).
+ 	setContentIdentity(v, q)
+@@ -593,7 +612,26 @@ func (h *Handler) toStreamItem(externalURL string, q meta.Query, res prowlarr.Re
+ 	if res.Indexer != "" {
+ 		v.Set("ix", res.Indexer)
+ 	}
+-	playURL := fmt.Sprintf("%s/stremio/play/%s?%s", base, res.InfoHash, v.Encode())
++	// A magnet-less release has no infohash yet. Rather than paying the
++	// .torrent round trip while building the list (Prowlarr serializes those
++	// per indexer, so a 9-result page took 12-18s and Stremio answered "no
++	// addon" instead of showing the list), pass the Prowlarr download link
++	// through and resolve it in the play handler. The path segment only has
++	// to be unique per stream for Stremio's bookkeeping, so the link's own
++	// token stands in for the not-yet-known infohash.
++	pathID := res.InfoHash
++	if pathID == "" {
++		if res.DownloadURL == "" {
++			return streamItem{} // no magnet, no hash, no link — unresolvable
++		}
++		v.Set("dl", res.DownloadURL)
++		// Carry the title so the resolved magnet gets a display name and
++		// the play log stays readable.
++		v.Set("t", res.Title)
++		pathID = "dl-" + downloadToken(res.DownloadURL)
++		pathID = "dl-" + downloadToken(res.DownloadURL)
++	}
++	playURL := fmt.Sprintf("%s/stremio/play/%s?%s", base, pathID, v.Encode())
+ 
+ 	// Surface the parsed resolution on the name's second line so Stremio's
+ 	// resolution badge and AIOStreams' grouping resolve cleanly.
